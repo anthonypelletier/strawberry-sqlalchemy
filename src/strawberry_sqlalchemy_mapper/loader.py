@@ -12,7 +12,7 @@ from typing import (
     Union,
 )
 
-from sqlalchemy import select, tuple_
+from sqlalchemy import select, tuple_, func, desc, asc
 from sqlalchemy.engine.base import Connection
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from sqlalchemy.orm import RelationshipProperty, Session
@@ -63,13 +63,54 @@ class StrawberrySQLAlchemyLoader:
             related_model = relationship.entity.entity
 
             async def load_fn(keys: List[Tuple]) -> List[Any]:
-                query = select(related_model).filter(
-                    tuple_(
-                        *[remote for _, remote in relationship.local_remote_pairs or []]
-                    ).in_(keys)
+                """
+                Implement sorting, filtering and pagination, without N+1 problems
+                Based on https://github.com/sqlalchemy/sqlalchemy/wiki/RangeQuery-and-WindowedRangeQuery
+                Thanks to @bellini666 for the idea
+                @param keys: List[Tuple]
+                @return: List[Any
+                """
+
+                remote_column = list(relationship.remote_side)[0].name
+
+                # Variables for pagination and sorting
+                page_number = 1
+                page_size = 2
+                sort_column = "id"
+                sort_direction = "desc"
+                filter_conditions = [related_model.id <= 1000]
+
+                # Apply the sorting
+                if sort_direction == "desc":
+                    order_by_column = desc(getattr(related_model, sort_column))
+                else:
+                    order_by_column = asc(getattr(related_model, sort_column))
+
+                # Assign a row number to each remote item based on the remote column
+                row_number_column = func.row_number().over(
+                    partition_by=getattr(related_model, remote_column),
+                    order_by=order_by_column
+                ).label('row_num')
+
+                # Add the row number column and conditions to the query
+                subquery = (
+                    select(related_model, row_number_column)
+                    .filter(*filter_conditions)
+                    .filter(
+                        tuple_(
+                            *[remote for _, remote in relationship.local_remote_pairs or []]
+                        ).in_(keys)
+                    )
+                    .subquery(f"{related_model.__tablename__}_subquery")
                 )
-                if relationship.order_by:
-                    query = query.order_by(*relationship.order_by)
+
+                # Filter the results to get the desired page for each remote column
+                start_row = (page_number - 1) * page_size + 1
+                end_row = start_row + page_size - 1
+                query = (select(related_model)
+                         .join(subquery, related_model.id == subquery.c.id)
+                         .filter(subquery.c.row_num.between(start_row, end_row)))
+
                 rows = await self._scalars_all(query)
 
                 def group_by_remote_key(row: Any) -> Tuple:
